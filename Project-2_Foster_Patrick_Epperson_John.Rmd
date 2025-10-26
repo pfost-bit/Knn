@@ -1,0 +1,1193 @@
+---
+title:  |
+        | Disaster Relief Project
+        | Part Two
+author: |
+        | Group Nine
+        | Patrick Foster
+        | John Michael Epperson 
+date: April 21, 2025
+output:
+  revealjs::revealjs_presentation:
+    theme: black
+    highlight: pygments
+    center: true
+    self_contained: false
+    reveal_plugins: ["notes", "menu"]
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(cache=TRUE, autodep=TRUE,cache.lazy = T)
+knitr::opts_chunk$set(fig.align="center", fig.pos="tbh", fig.height = 3, fig.width = 6)
+knitr::opts_chunk$set(echo=FALSE, message=FALSE, warning=FALSE)
+knitr::opts_chunk$set(fig.pos = "H", out.extra = "")
+
+library(tidymodels)
+library(tidyverse)
+library(patchwork)
+library(discrim)
+library(patchwork)
+library(ggrepel)
+library(ggmap)
+library(dotenv)
+library(webshot)
+library(plotly)
+library(kableExtra)
+library(brulee)
+library(bonsai)
+library(xgboost)
+library(themis)
+library(future)
+
+load_dot_env(file = '../.env')
+
+gmapkey <- Sys.getenv('gmapskey')
+
+register_google(key = gmapkey)
+
+set.seed(9)
+```
+
+```{r setup-parallel}
+#| cache: FALSE
+#| message: FALSE
+#| cache.lazy: FALSE
+library(future)
+plan(multisession(workers = 20))
+```
+
+# Introduction
+
+```{r aerial, fig.cap='Examples of aerial imagery captured by the team from Rochester Institute of Technology.',fig.show='hold',out.width='30%'}
+knitr::include_graphics(c('../data/village1.jpg','../data/village3.jpg','../data/village2.jpg'))
+```
+
+# Data
+
+```{r read-in-data}
+get_holdouts <- function(file) {
+  
+  infile <- read_lines(file,n_max = 20)
+  
+  col_row <- infile %>% 
+    data.frame() %>% 
+    mutate(text = gsub(';','',.)) %>% 
+    dplyr::select(-.)%>% 
+    mutate(end = right(text,2) == 'B3',
+           row = row_number()) %>% 
+    filter(end==T) %>% 
+    dplyr::select(row)
+  
+  f <- suppressWarnings(read_table(file,skip = col_row$row-1,n_max = 20,col_types = cols()))
+  
+  long_cols <- c('ID','X','Y','Map_X','Map_Y','Lat','Long','B1','B2','B3')
+  short_cols <- c('B1','B2','B3')
+  
+  if (ncol(f) > 4) {
+    final <- read_table(file,skip = col_row$row,col_names = long_cols,col_types = cols())
+  } else {
+    final <- read_table(file,skip = col_row$row,col_names = short_cols,col_types = cols())
+  }
+  
+}
+
+left <- function (x,n) substr(x,1,n)
+right <- function(x,n) substr(x,nchar(x)-n+1,nchar(x))
+
+training <- read_csv('../data/HaitiPixels.csv') %>% 
+  mutate(Class = factor(Class)) %>% 
+  mutate(Tarp = factor(ifelse(Class=='Blue Tarp','Tarp','Not Tarp'))) %>% 
+  mutate(Tarp = fct_relevel(Tarp,c('Tarp','Not Tarp')))
+
+holdout <- data.frame(path = list.files('../data/holdouts',recursive = T,pattern = '.txt',full.names = T)) %>% 
+  dplyr::rowwise() %>% 
+  mutate(data = list(get_holdouts(path))) %>% 
+  dplyr::ungroup()
+```
+
+## Data Breakdown
+
+* Training Set, labeled as follows
+  * Blue Tarp
+  * Rooftop
+  * Soil
+  * Various Non-Tarp
+  * Vegetation
+  
+. . .
+
+* Holdout Set
+  * over **two million** observations
+  * Unlabeled
+
+
+
+## The training dataset.    
+
+```{r training_summary, eval=FALSE}
+#| include: false
+summary(training) %>% kbl(caption = 'Summary of Training Data',booktabs = T,format = 'html',align = 'c') %>% 
+  kable_styling(bootstrap_options = c('striped'),position = 'center',full_width = F) %>% 
+  kable_material_dark()
+
+```
+
+## Classifications of Training Set
+
+```{r}
+#| fig.width: 6
+#| fig.height: 3
+cols <- c('Blue Tarp' = 'blue','Rooftop' = 'black','Soil'='brown','Various Non-Tarp' = 'darkred','Vegetation'='darkgreen')
+
+training %>% 
+  ggplot(aes(x=Tarp, fill = Class)) +
+  geom_bar(position = "stack")+
+  scale_fill_manual(values=cols)+
+  labs(x = "Tarp Status")+
+  theme(plot.title = element_text(hjust = .5))
+```
+
+# RGB Parameter Analysis
+
+```{r}
+training_rgb <- training %>% 
+  dplyr::select(Red,Green,Blue) %>% 
+  mutate(
+    RGB = rgb(Red, Green, Blue, maxColorValue = 255)
+  )
+
+
+```
+
+
+```{r}
+#| fig.width: 6
+#| fig.height: 3
+#| fig.cap: 'Histograms of RGB Values'
+
+df_long <- training_rgb %>%
+  dplyr::select(Red,Green,Blue) %>% 
+  pivot_longer(cols = c(Red, Green, Blue), names_to = "Channel", values_to = "Value")
+
+# Create histograms for each channel
+ggplot(df_long, aes(x = Value, fill = Channel)) +
+  geom_histogram(binwidth = 5, alpha = 0.3, position = "identity") +
+  facet_wrap(~ Channel, scales = "free_y") +
+  labs(title = "Histograms of RGB Values", x = "Value", y = "Count") +
+  scale_fill_manual(values = c("blue", "green", "red")) +
+  theme_minimal()+
+  theme(plot.title = element_text(hjust = .5))
+
+```
+## Training Set RGB
+
+```{r}
+#| fig.width: 6
+#| fig.height: 3
+#| fig.cap: 'One-Dimensional RGB Gradient of Training Set'
+
+training_rgb$id <- 1:nrow(training_rgb)
+
+# Plot the gradient
+ggplot(training_rgb, aes(x = factor(id), y = 1, fill = RGB)) +
+  geom_tile() +
+  scale_fill_identity() + 
+  theme_void() +
+  labs(title = "One-Dimensional RGB Gradient of training set")+
+  theme(plot.title = element_text(hjust = .5))
+  
+
+
+```
+
+## Training Set RGB
+
+```{r 3dtrain, fig.cap='3D Scatter plot of RGB values of the training set.'}
+#| fig.pos: H
+#| out.width: "80%"
+#| fig.align: "center"
+p <- training_rgb %>%
+  plot_ly(x = ~Red, y = ~Green, z = ~Blue, type = 'scatter3d', mode = 'markers', marker = list(size = 3, color = ~RGB)) %>% 
+    layout(scene = list(
+    xaxis = list(title = 'Red'),
+    yaxis = list(title = 'Green'),
+    zaxis = list(title = 'Blue'),
+    camera = list(
+      eye = list(x =sqrt(2),
+                 y =-sqrt(2),
+                 z =.2
+                   )
+    )
+  ),
+  title = '3D Scatter Plot of RGB Values Training')
+
+#plotly::kaleido(p, file = "plotly_training.png" )
+knitr::include_graphics("../plotly_training.png")
+```  
+
+## The holdout dataset  
+
+
+```{r}
+holdout_combo <- holdout %>% 
+  unnest(data) %>% 
+  na.omit()%>% 
+  mutate(b123 = rgb(B1,B2,B3,maxColorValue = 255),
+         b213 = rgb(B2,B1,B3,maxColorValue = 255),
+         b132 = rgb(B1,B3,B2,maxColorValue = 255),
+         b312 = rgb(B3,B1,B2,maxColorValue = 255),
+         b321 = rgb(B3,B2,B1,maxColorValue = 255),
+         b231 = rgb(B2,B3,B1,maxColorValue = 255)) %>% 
+  rename(lon=Long,lat=Lat) %>% 
+  dplyr::select(path,lat,lon,B1,B2,B3,b123,b132,b213,b231,b321,b312) %>% 
+  nest(data = c(lat,lon,B1,B2,B3,b123,b132,b213,b231,b321,b312))
+
+all_holdout <- holdout_combo %>% 
+  dplyr::select(data) %>% 
+  unnest(data) 
+```
+
+## Holdout Summary
+
+```{r eval=FALSE}
+#| warning: false
+#| include: false
+summary(holdout_combo %>% dplyr::select(data) %>% unnest(data) %>% dplyr::select(B1,B2,B3)) %>% kbl(caption = 'Holdout set summary statistics.',booktabs = T) %>% 
+  kable_styling(latex_options = c('hold_position','striped'),position = 'center')
+```
+
+* B1 = Red (R)
+* B2 = Green (G)
+* B3 = Blue (B)  
+
+## Holdout RGB
+
+```{r}
+#| fig.width: 6
+#| fig.height: 3
+#| fig.cap: 'One-Dimensional RGB Gradient of Blue Holdout File'
+
+blues <- holdout$data[[2]]
+
+blues <- blues%>% 
+rowwise() %>%
+  mutate(
+    rgb_matrix = list(col2rgb(rgb(B1,B2,B3, maxColorValue = 255)) / 255),  # Convert HEX to RGB and normalize
+    hue = rgb2hsv(rgb_matrix[1], rgb_matrix[2], rgb_matrix[3])[1]  # Extract Hue
+  ) %>%
+  ungroup() %>%
+  arrange(hue)
+
+blues$id <- 1:nrow(blues)
+
+# Plot the gradient
+ggplot(blues, aes(x = factor(id), y = 1, fill = rgb(B1,B2,B3, maxColorValue = 255))) +
+  geom_tile() +
+  scale_fill_identity() + 
+  theme_void() +
+  labs(title = "One-Dimensional RGB Gradient of Blue holdout file")+
+  theme(plot.title = element_text(hjust = .5))
+```
+
+# Exploratory Data Analysis on a Holdout Data Subset
+
+```{r}
+sampled_holdout <- sample_n(all_holdout, size = .03*nrow(all_holdout)) %>% 
+  dplyr::select(B1,B2,B3)
+```
+
+```{r}
+
+# Rename columns for clarity
+colnames(sampled_holdout) <- c("R", "G", "B")
+
+# Convert rows to RGB values
+sampled_holdout <- sampled_holdout %>%
+  mutate(RGB = rgb(R, G, B, maxColorValue = 255))
+```
+
+```{r}
+#| fig.width: 6
+#| fig.height: 3
+#| fig.cap: 'Histograms of RGB values for holdout dataset.'
+
+
+# Create a long-format dataframe for easier plotting
+df_long <- sampled_holdout %>%
+  dplyr::select(R,G,B) %>% 
+  pivot_longer(cols = c(R, G, B), names_to = "Channel", values_to = "Value")
+
+# Create histograms for each channel
+ggplot(df_long, aes(x = Value, fill = Channel)) +
+  geom_histogram(binwidth = 5, alpha = 0.3, position = "identity") +
+  facet_wrap(~ Channel, scales = "free_y") +
+  labs(title = "Histograms of RGB Values", x = "Value", y = "Count") +
+  scale_fill_manual(values = c("blue", "green", "red")) +
+  theme_minimal()
+
+```
+
+## Holdout RGB
+
+```{r fig.cap='One-Dimensional RGB Gradient of Sampled Holdouts'}
+
+sampled_holdout <- sampled_holdout%>% 
+rowwise() %>%
+  mutate(
+    rgb_matrix = list(col2rgb(RGB) / 255),  # Convert HEX to RGB and normalize
+    hue = rgb2hsv(rgb_matrix[1], rgb_matrix[2], rgb_matrix[3])[1]  # Extract Hue
+  ) %>%
+  ungroup() %>%
+  arrange(hue)
+
+sampled_holdout$id <- 1:nrow(sampled_holdout)
+# Plot the gradient
+ggplot(sampled_holdout, aes(x = factor(id), y = 1, fill = RGB)) +
+  geom_tile() +
+  scale_fill_identity() + 
+  theme_void() +
+  labs(title = "One-Dimensional RGB Gradient of Sampled Holdouts")+
+  theme(plot.title = element_text(hjust = .5))
+```
+
+## Holdout RGB
+
+```{r 3dhold, fig.cap='Scatterplot of RBG values of the holdout set.'}
+#| fig.pos: H
+#| out.width: "80%"
+#| fig.align: "center"
+
+q <- sampled_holdout %>%
+  plot_ly(x = ~R, y = ~G, z = ~B, type = 'scatter3d', mode = 'markers', marker = list(size = 3, color = ~RGB)) %>% 
+    layout(scene = list(
+    xaxis = list(title = 'Red'),
+    yaxis = list(title = 'Green'),
+    zaxis = list(title = 'Blue'),
+    camera = list(
+      eye = list(x =sqrt(2),
+                 y =-sqrt(2),
+                 z =.2
+                   )
+    )
+  ),
+  title = '3D Scatter Plot of RGB Values of the HoldOut Set')
+
+#plotly::save_image(q, file = "plotly_holdout.png" )
+knitr::include_graphics("../plotly_holdout.png")
+
+```  
+
+# Results
+
+# #Models without Tuning
+
+```{r datasplit}
+dsplit = initial_split(training,prop = 0.8,strata = Tarp)
+train = training(dsplit)
+test = testing(dsplit)
+```
+
+```{r define-recipe}
+formula <- Tarp ~ Red + Green + Blue
+d_recipe <- recipe(formula,data=train)
+
+d_recipe_tune <- recipe(formula,data=train) %>% 
+  step_smote(over_ratio = tune())
+```
+
+### Define Workflows
+
+```{r}
+resamples <- vfold_cv(train, v=10, strata=Tarp)
+custom_metrics <- metric_set(roc_auc, accuracy,f_meas)
+cv_control <- control_resamples(save_pred=TRUE,save_workflow = T,event_level = 'first')
+
+logreg_spec <- logistic_reg(mode='classification', engine='glm')
+lda_spec <- discrim_linear(mode = 'classification',engine = 'MASS')
+qda_spec <- discrim_quad(mode = 'classification',engine = 'MASS')
+
+logreg_wf <- workflow() %>%
+    add_recipe(d_recipe) %>%
+    add_model(logreg_spec)
+
+lda_wf <- workflow() %>% 
+  add_recipe(d_recipe) %>% 
+  add_model(lda_spec)
+
+qda_wf <- workflow() %>% 
+  add_recipe(d_recipe) %>% 
+  add_model(qda_spec)
+
+logreg_tune_wf <- workflow() %>% 
+  add_recipe(d_recipe_tune) %>% 
+  add_model(logistic_reg(mode = 'classification',engine='glmnet',
+                         penalty = tune(),
+                         mixture = tune()))
+
+knn_wf <- workflow() %>% 
+  add_recipe(d_recipe_tune) %>% 
+  add_model(nearest_neighbor(mode = 'classification',
+                             neighbors = tune()))
+
+rf_wf <- workflow() %>% 
+  add_recipe(d_recipe_tune) %>% 
+  add_model(rand_forest(mode = 'classification',engine = 'ranger',
+                        mtry = tune(),
+                        trees = 1000,
+                        min_n = tune()))
+
+boost_wf <- workflow() %>% 
+  add_recipe(d_recipe_tune) %>% 
+  add_model(boost_tree(mode = 'classification',engine = 'xgboost',
+                       mtry = tune(),
+                       trees = 1000,
+                       min_n = tune()))
+
+svm_lin_wf <- workflow() %>% 
+  add_recipe(d_recipe) %>% 
+  add_model(svm_linear(mode = 'classification',engine = 'kernlab',
+                       cost = tune(),
+                       margin = tune()))
+
+svm_poly_wf <- workflow() %>% 
+  add_recipe(d_recipe_tune) %>% 
+  add_model(svm_poly(mode = 'classification',engine = 'kernlab',
+                     cost = tune(),
+                     margin = tune(),
+                     degree = tune()))
+
+svm_rbf_wf <- workflow() %>% 
+  add_recipe(d_recipe) %>% 
+  add_model(svm_rbf(mode = 'classification',engine = 'kernlab',
+                    cost = tune(),
+                    rbf_sigma = tune()))
+
+mlp_wf <- workflow() %>% 
+  add_recipe(d_recipe_tune) %>% 
+  add_model(mlp(mode = 'classification',engine = 'brulee',
+                hidden_units = tune(),
+                penalty = tune(),
+                epochs = tune()))
+```
+
+```{r tune_func}
+tune_func <- function (wf, best_by, modelname, params, iter = 20) {
+
+  resamples <- vfold_cv(train, v=10, strata=Tarp)
+  custom_metrics <- metric_set(roc_auc,f_meas)
+  bayescontrol <- control_bayes(save_pred=TRUE,save_workflow = T,event_level = 'first',seed = 9,verbose = TRUE)
+
+  tune_results <- tune_bayes(wf,
+      resamples=resamples,
+      control=bayescontrol,
+      metrics = custom_metrics,
+      iter = iter,
+      param_info = params)
+
+  best <- dplyr::select_best(tune_results,metric = best_by)
+  plot <- autoplot(tune_results) + ggtitle(modelname)
+  
+  return(list(best=best,plot=plot))
+}
+```
+
+### Tune Models
+
+```{r tune_lr, warning=F, message=FALSE, eval=FALSE}
+params <- extract_parameter_set_dials(logreg_tune_wf) %>%
+    update(over_ratio = over_ratio(c(0,1)),
+           penalty = penalty(range = c(-10,1),trans = transform_log10()),
+           mixture = mixture(range = c(0,1))
+           )
+
+lr_results <- tune_func(logreg_tune_wf,best_by = 'f_meas',params = params, modelname = "Log. Reg. Tuned")
+lr_results$plot
+```
+---
+```{r tune_knn, warning=F,message=F, eval=FALSE}
+params <- extract_parameter_set_dials(knn_wf) %>%
+    update(over_ratio = over_ratio(c(0,1)),
+           neighbors = neighbors(c(1,50))
+           )
+
+knn_results <- tune_func(knn_wf,best_by = 'f_meas',params = params, modelname = "KNN")
+knn_results$plot
+```
+
+---
+```{r tune_rf, message=FALSE, warning=FALSE, eval=FALSE}
+params <- extract_parameter_set_dials(rf_wf) %>%
+    update(over_ratio = over_ratio(c(0,1)),
+           min_n = min_n(c(2,50))
+           ) %>% 
+  finalize(train)
+
+rf_results <- tune_func(rf_wf,best_by = 'f_meas',params = params, modelname = "Random Forest")
+rf_results$plot
+```
+---
+```{r tune_xgboost, message=FALSE, warning=FALSE, eval=FALSE}
+params <- extract_parameter_set_dials(boost_wf) %>%
+    update(over_ratio = over_ratio(c(0,1)),
+           min_n = min_n(c(0,50))
+           ) %>% 
+  finalize(train)
+
+boost_results <- tune_func(boost_wf,best_by = 'f_meas',params = params, modelname = "Boosting (XGBoost)")
+boost_results$plot
+```
+---
+```{r tune_svm_lin, message=FALSE, warning=FALSE, eval=FALSE}
+params <- extract_parameter_set_dials(svm_lin_wf)
+
+svm_lin_results <- tune_func(svm_lin_wf,best_by = 'f_meas',params = params, modelname = "Linear SVM")
+save.image(file = 'backup.RData')
+svm_lin_results$plot
+```
+---
+```{r tune_svm_poly, message=FALSE, warning=FALSE, eval=FALSE}
+params <- extract_parameter_set_dials(svm_poly_wf) %>% 
+  update(degree = degree_int(range=c(2,5)),
+         over_ratio = over_ratio(c(0,1)))
+
+svm_poly_results <- tune_func(svm_poly_wf,best_by = 'f_meas',params = params, modelname = "Polynomial SVM")
+save.image(file = 'backup.RData')
+svm_poly_results$plot
+```
+---
+```{r tune_svm_rbf, message=FALSE, warning=FALSE, eval=FALSE}
+params <- extract_parameter_set_dials(svm_rbf_wf)
+
+svm_rbf_results <- tune_func(svm_rbf_wf,best_by = 'f_meas',params = params, modelname = "Radial Basis Function SVM")
+save.image(file = 'backup.RData')
+svm_rbf_results$plot
+```
+
+---
+
+```{r tune_mlp, message=FALSE, warning=FALSE, eval=FALSE}
+params <- extract_parameter_set_dials(mlp_wf) %>% 
+  update(over_ratio = over_ratio(c(0,1)))
+
+mlp_results <- tune_func(mlp_wf,best_by = 'f_meas',params = params, modelname = "Multi-Layer Perceptron")
+save.image(file = 'backup.RData')
+mlp_results$plot
+```
+
+```{r fig.height=10, fig.width=15, eval=FALSE}
+lr_results$plot + knn_results$plot + rf_results$plot + boost_results$plot + svm_lin_results$plot + svm_poly_results$plot + svm_rbf_results$plot + mlp_results$plot
+```
+
+### Hyperparameters Summary
+
+```{r eval=FALSE}
+hyperparameters <- bind_rows(lr_results$best %>% mutate('model'='Log. Reg.'),
+          knn_results$best %>% mutate('model'='KNN'),
+          rf_results$best %>% mutate('model'='Random Forest'),
+          boost_results$best %>% mutate('model'='Boost (XGBoost)'),
+          svm_lin_results$best %>% mutate('model'='Linear SVM'),
+          svm_poly_results$best %>% mutate('model'='Polynomial SVM'),
+          svm_rbf_results$best %>% mutate('model'='Radial Basis Function SVM'),
+          mlp_results$best %>% mutate('model'='Multi-Layer Perceptron')) %>% 
+  dplyr::dplyr::select(-.config) 
+
+mean_overratio = mean(hyperparameters$over_ratio,na.rm=T)
+
+hyperparameters$over_ratio <- hyperparameters$over_ratio %>% 
+  replace_na(mean_overratio)
+
+hyperparameters %>% 
+  pivot_longer(-model,names_to = 'Hyperparameter') %>% 
+  drop_na() %>% 
+  kbl(caption = 'Optimal Tuning Parameters',booktabs = T) %>% 
+  kable_styling(latex_options = c('hold_position','striped'),position = 'center') %>% 
+  collapse_rows(columns = 1)
+```
+
+
+```{r eval=FALSE}
+hyperparameters %>% 
+  pivot_longer(-model,names_to = 'Hyperparameter') %>% 
+  drop_na() %>% 
+  write_excel_csv(file='figs/hyperparams.csv')
+```
+
+### Finalize Models with Best Parameters
+
+```{r}
+logreg_tune_wf_final <- workflow() %>% 
+  add_recipe(recipe(formula,data=train) %>% 
+                step_smote(over_ratio = 0.2064923)
+             ) %>% 
+  add_model(logistic_reg(mode = 'classification',engine='glmnet',
+                         penalty = 0.0000028,
+                         mixture = 0.9996662))
+
+knn_wf_final <- workflow() %>% 
+  add_recipe(recipe(formula,data=train) %>% 
+                step_smote(over_ratio = 0.3824401)
+             ) %>% 
+  add_model(nearest_neighbor(mode = 'classification',
+                             neighbors = 7))
+
+rf_wf_final <- workflow() %>% 
+  add_recipe(recipe(formula,data=train) %>% 
+                step_smote(over_ratio = 0.0579458)
+             ) %>%
+  add_model(rand_forest(mode = 'classification',engine = 'ranger',
+                        mtry = 1,
+                        trees = 1000,
+                        min_n = 4))
+
+boost_wf_final <- workflow() %>% 
+  add_recipe(recipe(formula,data=train) %>% 
+                step_smote(over_ratio = 0)
+             ) %>%
+  add_model(boost_tree(mode = 'classification',engine = 'xgboost',
+                       mtry = 3,
+                       trees = 1000,
+                       min_n = 0))
+
+svm_lin_wf_final <- workflow() %>% 
+  add_recipe(recipe(formula,data=train) %>% 
+                step_smote(over_ratio = 0.3475609)
+             ) %>%
+  add_model(svm_linear(mode = 'classification',engine = 'kernlab',
+                       cost = 10.4713709,
+                       margin = 0.1861540))
+
+svm_poly_wf_final <- workflow() %>% 
+  add_recipe(recipe(formula,data=train) %>% 
+                step_smote(over_ratio = 0.5000000)
+             ) %>%
+  add_model(svm_poly(mode = 'classification',engine = 'kernlab',
+                     cost = 32,
+                     margin = 0.1,
+                     degree = 5))
+
+svm_rbf_wf_final <- workflow() %>% 
+  add_recipe(recipe(formula,data=train) %>% 
+                step_smote(over_ratio = 0.3475609)
+             ) %>%
+  add_model(svm_rbf(mode = 'classification',engine = 'kernlab',
+                    cost = 2.3784142,
+                    rbf_sigma = 1))
+
+mlp_wf_final <- workflow() %>% 
+  add_recipe(recipe(formula,data=train) %>% 
+                step_smote(over_ratio = 0.9384875)
+             ) %>%
+  add_model(mlp(mode = 'classification',engine = 'brulee',
+                hidden_units = 21,
+                penalty = 0.0003426,
+                epochs = 433))
+```
+
+## Fit Cross Validation Resamples
+
+```{r fit_resamples}
+plan(multisession,workers=20)
+logreg_cv_notune <- fit_resamples(logreg_wf,resamples,metrics = custom_metrics,control = cv_control)
+lda_cv_notune <- fit_resamples(lda_wf,resamples,metrics = custom_metrics,control = cv_control)
+qda_cv_notune <- fit_resamples(qda_wf,resamples,metrics = custom_metrics,control = cv_control)
+
+logreg_cv <- fit_resamples(logreg_tune_wf_final,resamples,metrics = custom_metrics,control = cv_control)
+knn_cv <- fit_resamples(knn_wf_final,resamples,metrics = custom_metrics,control = cv_control)
+boost_cv <- fit_resamples(boost_wf_final,resamples,metrics = custom_metrics,control = cv_control)
+svm_lin_cv <- fit_resamples(svm_lin_wf_final,resamples,metrics = custom_metrics,control = cv_control)
+svm_poly_cv <- fit_resamples(svm_poly_wf_final,resamples,metrics = custom_metrics,control = cv_control)
+svm_rbf_cv <- fit_resamples(svm_rbf_wf_final,resamples,metrics = custom_metrics,control = cv_control)
+mlp_cv <- fit_resamples(mlp_wf_final,resamples,metrics = custom_metrics,control = cv_control)
+rf_cv <- fit_resamples(rf_wf_final,resamples,metrics = custom_metrics,control = cv_control)
+
+#save.image(file = 'backup.RData')
+```
+---
+
+```{r}
+cv_metrics <- bind_rows(
+  collect_metrics(logreg_cv_notune) %>% mutate(model='Logistic Regression'),
+  collect_metrics(lda_cv_notune) %>% mutate(model='LDA'),
+  collect_metrics(qda_cv_notune) %>% mutate(model='QDA'),
+  collect_metrics(logreg_cv) %>% mutate(model='Log. Reg. Tuned'),
+  collect_metrics(knn_cv) %>% mutate(model='KNN'),
+  collect_metrics(rf_cv) %>% mutate(model='Random Forest'),
+  collect_metrics(boost_cv) %>% mutate(model='Boosted'),
+  collect_metrics(svm_lin_cv) %>% mutate(model='Linear SVM'),
+  collect_metrics(svm_poly_cv) %>% mutate(model='Polynomial SVM'),
+  collect_metrics(svm_rbf_cv) %>% mutate(model='Radial Basis Function SVM'),
+  collect_metrics(mlp_cv) %>% mutate(model='Multi-Layer Perceptron')
+) %>% 
+  dplyr::select(-.estimator,-n,-.config) %>% 
+  pivot_wider(names_from = .metric,
+              values_from = c(mean,std_err))
+
+cv_metrics %>% 
+  rename(avgAccuracy = mean_accuracy,avgFmeas=mean_f_meas,avgAUC = mean_roc_auc,StDevAccuracy = std_err_accuracy,StDevFmeas = std_err_f_meas,StDevAUC = std_err_roc_auc) %>%
+  arrange(desc(avgFmeas)) %>% 
+  kbl(caption = 'Summary of Cross Validation Metrics Before Threshold Selection',booktabs = T) %>% 
+  kable_styling(latex_options = c('hold_position','striped'),position = 'center')
+```
+
+```{r}
+cv_metrics %>% 
+  rename(avgAccuracy = mean_accuracy,avgFmeas=mean_f_meas,avgAUC = mean_roc_auc,StDevAccuracy = std_err_accuracy,StDevFmeas = std_err_f_meas,StDevAUC = std_err_roc_auc) %>%
+  arrange(desc(avgFmeas)) %>% 
+  write_excel_csv(file='figs/cvmetricsprethreshold.csv')
+```
+
+## Threshold Scanning
+
+```{r threshold-scan, include=F}
+threshold_scan <- function(wf, model_name) {
+    threshold_data <- wf %>% 
+        last_fit(dsplit,metrics = custom_metrics) %>% 
+        dplyr::select(.predictions) %>% 
+        unnest() %>% 
+        probably::threshold_perf(truth = Tarp, estimate = .pred_Tarp,
+                  thresholds=seq(0.01, 0.99, 0.01), event_level="first",
+                  metrics=metric_set(f_meas))
+    opt_threshold <- threshold_data %>% 
+        arrange(-.estimate) %>% 
+        first() %>% 
+        mutate('Model' = model_name) %>% 
+        dplyr::select(-.metric,-.estimator)
+    g <- ggplot(threshold_data, aes(x=.threshold, y=.estimate)) +
+        geom_line() +
+        geom_point(data=opt_threshold, color="red", size=2) +
+        labs(title=model_name, x="Threshold", y="F Measurement") +
+        coord_cartesian(ylim=c(0.01, 1))
+    return(list(
+        graph=g,
+        threshold=opt_threshold
+    ))
+}
+```
+
+**if you have issues with the MLP or get the error `best_epoch should be an integer` try `pak::pak(c("tidymodels/brulee@best-iter-int"), ask = FALSE)` as per @topepo**
+* ['best_epoch' should be an integer](https://github.com/tidymodels/brulee/issues/93)
+
+
+```{r threshold-scan, include=F, fig.height=6,fig.width=10, cache=FALSE}
+g1 <- threshold_scan(logreg_wf, "Logistic regression")
+g2 <- threshold_scan(lda_wf, "LDA")
+g3 <- threshold_scan(qda_wf, "QDA")
+g4 <- threshold_scan(logreg_tune_wf_final, "Log. Reg Tuned")
+g5 <- threshold_scan(knn_wf_final, "KNN")
+g6 <- threshold_scan(rf_wf_final, "Random Forest")
+g7 <- threshold_scan(boost_wf_final, "Boosted Tree (XGBoost)")
+g8 <- threshold_scan(svm_lin_wf_final, "Linear SVM")
+g9 <- threshold_scan(svm_poly_wf_final, "Polynomial SVM")
+g10 <- threshold_scan(svm_rbf_wf_final, "Radial Basis Function SVM")
+
+g11 <- threshold_scan(mlp_wf_final, "Multi-Layer Perceptron")
+
+best_thresholds <- bind_rows(g1$threshold,g2$threshold,g3$threshold,g4$threshold,
+          g5$threshold,g6$threshold,g7$threshold,g8$threshold,
+          g9$threshold,g10$threshold,g11$threshold)
+
+g1$graph + g2$graph + g3$graph + g4$graph + g5$graph + g6$graph + g7$graph + g8$graph + g9$graph +g10$graph + g11$graph
+```
+
+## Threshold Scan Results
+
+```{r eval=FALSE}
+best_thresholds %>% 
+  arrange(-.estimate) %>% 
+  write_excel_csv(file='figs/thresholds.csv')
+```
+
+```{r}
+best_thresholds %>% 
+  arrange(-.estimate) %>% 
+  rename('Threshold'=.threshold,'F Measurement'=.estimate) %>% 
+  dplyr::select(Model,Threshold,'F Measurement') %>% 
+  kbl(caption = 'Summary of Cross Validation Metrics Before Threshold Selection',booktabs = T) %>% 
+  kable_styling(latex_options = c('hold_position','striped'),position = 'center')
+```
+
+```{r selected-thresholds, fig.height=6,fig.width=10}
+best_thresholds %>% 
+  #round(.estimate,2) %>% 
+  ggplot(aes(x=reorder(Model,-.estimate),y=.estimate,fill = Model))+
+  geom_bar(stat = 'identity',show.legend = F)+
+  geom_label(aes(label = round(.estimate,3)),vjust=0,show.legend = F)+
+  geom_label(aes(label=paste('Thresh\n',.threshold)),vjust=2,show.legend = F)+
+  labs(x='Model',y='F Measurement')+
+  theme(axis.text.x = element_text(angle = 45, vjust = 1, hjust=1))
+```
+
+
+get performance at threshold
+  roc curves
+  compare test/train performance
+
+## ROC Curves
+
+```{r roc-curve-cv, fig.cap='ROC Curves on 10 Fold Cross Validation'}
+roc_cv_data <- function(model_cv) {
+    cv_predictions <- collect_predictions(model_cv)
+    cv_predictions %>%
+        roc_curve(truth=Tarp, .pred_Tarp, event_level="first")
+}
+
+roc_table <- bind_rows(
+    roc_cv_data(logreg_cv_notune) %>% mutate(model="Logistic regression"),
+    roc_cv_data(lda_cv_notune) %>% mutate(model="LDA"),
+    roc_cv_data(qda_cv_notune) %>% mutate(model="QDA"),
+    roc_cv_data(logreg_cv) %>% mutate(model='Log. Reg. Tuned'),
+    roc_cv_data(knn_cv) %>% mutate(model='KNN'),
+    roc_cv_data(rf_cv) %>% mutate(model='Random Forest'),
+    roc_cv_data(boost_cv) %>% mutate(model='Boost (XGBoost)'),
+    roc_cv_data(svm_lin_cv) %>% mutate(model='Linear SVM'),
+    roc_cv_data(svm_poly_cv) %>% mutate(model='Polynomial SVM'),
+    roc_cv_data(svm_rbf_cv) %>% mutate(model='Radial Basis Function SVM'),
+    roc_cv_data(mlp_cv) %>% mutate(model='Multi-Layer Perceptron')
+)
+
+p1 <- roc_table %>%
+  ggplot(aes(x=1 - specificity, y=sensitivity, color=model)) +
+      geom_line(show.legend = T)+
+      geom_abline(linetype = 'dashed')
+
+p2 <- roc_table%>%
+  ggplot(aes(x=1 - specificity, y=sensitivity, color=model)) +
+      geom_line(show.legend = T)+
+      geom_abline(linetype = 'dashed')+
+      coord_cartesian(ylim = c(0.9,1),xlim = c(0,0.075))
+```
+
+
+```{r predictions}
+lr_preds <- logreg_wf %>% last_fit(dsplit)
+lda_preds <- lda_wf %>% last_fit(dsplit)
+qda_preds <- qda_wf %>% last_fit(dsplit)
+lr_tune_preds <- logreg_tune_wf_final %>% last_fit(dsplit)
+knn_preds <- knn_wf_final %>% last_fit(dsplit)
+rf_preds <- rf_wf_final %>% last_fit(dsplit)
+boost_preds <- boost_wf_final %>% last_fit(dsplit)
+svm_lin_preds <- svm_lin_wf_final %>% last_fit(dsplit)
+svm_poly_preds <- svm_poly_wf_final %>% last_fit(dsplit)
+svm_rbf_preds <- svm_rbf_wf_final %>% last_fit(dsplit)
+mlp_preds <- mlp_wf_final %>% last_fit(dsplit,metrics = custom_metrics)
+```
+
+```{r testroc, warning=FALSE}
+roc_data <- function(pred) {
+  pred %>%
+    collect_predictions() %>% 
+    yardstick::roc_curve(truth=Tarp, .pred_Tarp, event_level="first")
+}
+```
+
+```{r}
+roc_table_test <- bind_rows(
+    roc_data(lr_preds) %>% mutate(model="Logistic regression"),
+    roc_data(lda_preds) %>% mutate(model="LDA"),
+    roc_data(qda_preds) %>% mutate(model="QDA"),
+    roc_data(lr_tune_preds) %>% mutate(model='Log. Reg. Tuned'),
+    roc_data(knn_preds) %>% mutate(model='KNN'),
+    roc_data(rf_preds) %>% mutate(model='Random Forest'),
+    roc_data(boost_preds) %>% mutate(model='Boost (XGBoost)'),
+    roc_data(svm_lin_preds) %>% mutate(model='Linear SVM'),
+    roc_data(svm_poly_preds) %>% mutate(model='Polynomial SVM'),
+    roc_data(svm_rbf_preds) %>% mutate(model='Radial Basis Function SVM'),
+    roc_data(mlp_preds) %>% mutate(model='Multi-Layer Perceptron')
+)
+
+roc_cv <- roc_table %>%
+  ggplot(aes(x=1 - specificity, y=sensitivity, color=model)) +
+      geom_line(show.legend = F)+
+      geom_abline(linetype = 'dashed')+
+      coord_cartesian(ylim = c(0.9,1),xlim = c(0,0.075))+
+      labs(title='Cross Validation')+
+      geom_label_repel(aes(label = model))
+
+roc_test <- roc_table_test %>%
+  ggplot(aes(x=1 - specificity, y=sensitivity, color=model)) +
+      geom_line(show.legend = T)+
+      geom_abline(linetype = 'dashed')+
+      coord_cartesian(ylim = c(0.9,1),xlim = c(0,0.075))+
+      labs(title='Test Data')
+```
+
+## Performance on Test Data, comparisons with Training
+
+```{r}
+get_thresh <- function(model_name) {
+  best_thresholds %>% 
+  filter(Model == model_name) %>% 
+  dplyr::pull(.threshold)
+  
+}
+
+get_thresh('LDA')
+```
+
+```{r thresh-preds}
+predict_at_threshold <- function(model, data, threshold) {
+    return(
+        model %>%
+            augment(data) %>%
+            mutate(.pred_class = probably::make_two_class_pred(.pred_Tarp,
+                    c("Tarp", "Not Tarp"), threshold=threshold)
+            )
+    )
+}
+```
+
+```{r}
+lr_fit <- logreg_wf %>% fit(train)
+lda_fit <- lda_wf %>% fit(train)
+qda_fit <- qda_wf %>% fit(train)
+lr_tune_fit <- logreg_tune_wf_final %>% fit(train)
+knn_fit <- knn_wf_final %>% fit(train)
+rf_fit <- rf_wf_final %>% fit(train)
+boost_fit <- boost_wf_final %>% fit(train)
+svm_lin_fit <- svm_lin_wf_final %>% fit(train)
+svm_poly_fit <- svm_poly_wf_final %>% fit(train)
+svm_rbf_fit <- svm_rbf_wf_final %>% fit(train)
+mlp_fit <- mlp_wf_final %>% fit(train)
+```
+
+
+
+```{r metrics-at-threshold}
+custom_metrics <- metric_set(f_meas)
+
+calculate_metrics_at_threshold <- function(model, train, test, model_name) {
+  bind_rows(
+        # Accuracy of training set
+        bind_cols(
+            model=model_name, dataset="train", threshold=get_thresh(model_name = model_name),
+            custom_metrics(predict_at_threshold(model, train, get_thresh(model_name = model_name)), truth=Tarp, estimate=.pred_class),
+        ),
+        # AUC of ROC curve of training set
+        bind_cols(
+            model=model_name, dataset="train", threshold=get_thresh(model_name = model_name),
+            roc_auc(model %>% augment(train), Tarp, .pred_Tarp, event_level="first"),
+        ),
+        # Accuracy of holdout set
+        bind_cols(
+            model=model_name, dataset="test", threshold=get_thresh(model_name = model_name),
+            custom_metrics(predict_at_threshold(model, test, get_thresh(model_name = model_name)), truth=Tarp, estimate=.pred_class),
+        ),
+        # AUC of ROC curve of holdout set
+        bind_cols(
+            model=model_name, dataset="test", threshold=get_thresh(model_name = model_name),
+            roc_auc(model %>% augment(test), Tarp, .pred_Tarp, event_level="first"),
+        ),
+    )
+}
+
+plan(multisession,workers=20)
+metrics_at_threshold <- bind_rows(
+    calculate_metrics_at_threshold(lr_fit, train, test, "Logistic regression"),
+    calculate_metrics_at_threshold(lda_fit, train, test, "LDA"),
+    calculate_metrics_at_threshold(qda_fit, train, test, "QDA"),
+    calculate_metrics_at_threshold(lr_tune_fit, train, test, "Log. Reg Tuned"),
+    calculate_metrics_at_threshold(knn_fit, train, test, "KNN"),
+    calculate_metrics_at_threshold(rf_fit, train, test, "Random Forest"),
+    calculate_metrics_at_threshold(boost_fit, train, test, "Boosted Tree (XGBoost)"),
+    calculate_metrics_at_threshold(svm_lin_fit, train, test, "Linear SVM"),
+    calculate_metrics_at_threshold(svm_poly_fit, train, test, "Polynomial SVM"),
+    calculate_metrics_at_threshold(svm_rbf_fit, train, test, "Radial Basis Function SVM"),
+    calculate_metrics_at_threshold(mlp_fit, train, test, "Multi-Layer Perceptron")
+) %>% arrange(dataset) %>% 
+  pivot_wider(names_from = c(.metric,dataset),
+              values_from = .estimate) %>% 
+  dplyr::select(-.estimator)
+
+metrics_at_threshold %>% 
+  kbl(format = 'latex', caption = 'Model Performance at Optimal Threshold' ,booktabs = T) %>% 
+  kable_styling(latex_options = c('hold_position','striped'),position = 'center')
+```
+```{r}
+metrics_at_threshold %>% 
+  arrange(-f_meas_test) %>% 
+  write_excel_csv(file='figs/testvstrain.csv')
+```
+
+
+```{r}
+metrics_at_threshold %>% 
+  mutate(f_meas_diff = f_meas_train - f_meas_test) %>% 
+  ggplot(aes(x=model,y=f_meas_diff))+
+    geom_bar(stat='identity')+
+    labs(x='Model',y='Diff',title = 'Difference in F-Score between Test and Train')+
+    theme(axis.text.x = element_text(angle = 45, vjust = 1, hjust=1))
+```
+
+```{r fig.height=6, fig.width=10}
+metrics_at_threshold %>% 
+  dplyr::select(model,f_meas_test,f_meas_train) %>% 
+  pivot_longer(c(f_meas_test,f_meas_train)) %>% 
+  ggplot(aes(x=model,y=value,colour = name))+
+    geom_point()+
+    labs(x='Model',y='F Measurement',color = 'Dataset')+
+    theme(axis.text.x = element_text(angle = 45, vjust = 1, hjust=1))+
+    scale_color_manual(labels = c('Test','Train'), values = c("blue", "red"))
+```
+
+
+```{r final-metrics}
+custom_metrics <- metric_set(accuracy,sensitivity,specificity,precision)
+
+more_metrics <- function(model, train, test, name) {
+  threshold <- get_thresh(name)
+  bind_rows(custom_metrics(predict_at_threshold(model,train,threshold), truth=Tarp, estimate=.pred_class) %>% 
+  dplyr::select(-.estimator) %>% 
+  mutate(model = name, data = 'Train') %>% 
+  pivot_wider(names_from = .metric,
+              values_from = .estimate),
+  custom_metrics(predict_at_threshold(model,test,threshold), truth=Tarp, estimate=.pred_class) %>% 
+  dplyr::select(-.estimator) %>% 
+  mutate(model = name, data = 'Test') %>% 
+  pivot_wider(names_from = .metric,
+              values_from = .estimate)
+  )%>% 
+    rename(TPR = sensitivity) %>% 
+    mutate(FPR = 1-specificity) %>% 
+    dplyr::select(-specificity)
+}
+
+final_metrics <- bind_rows(more_metrics(lr_fit,train,test,'Logistic regression'),
+          more_metrics(lda_fit,train,test,'LDA'),
+          more_metrics(qda_fit,train,test,'QDA'),
+          more_metrics(lr_tune_fit,train,test,'Log. Reg Tuned'),
+          more_metrics(knn_fit,train,test,'KNN'),
+          more_metrics(rf_fit,train,test,'Random Forest'),
+          more_metrics(boost_fit,train,test,'Boosted Tree (XGBoost)'),
+          more_metrics(svm_lin_fit,train,test,'Linear SVM'),
+          more_metrics(svm_poly_fit,train,test,'Polynomial SVM'),
+          more_metrics(svm_rbf_fit,train,test,'Radial Basis Function SVM'),
+          more_metrics(mlp_fit,train,test,'Multi-Layer Perceptron')
+)
+
+final_metrics %>% kbl(caption = 'Accuracy, TPR, FPR, and Precision at selected threshold.',booktabs = T) %>% 
+  kable_styling(latex_options = c('hold_position','striped'),position = 'center')
+```
+
+```{r}
+final_metrics %>% 
+  write_excel_csv(file='figs/finalmetrics.csv')
+```
+
+```{r fig.height=10, fig.width=15}
+final_metrics %>% 
+  pivot_longer(c(accuracy,TPR,precision,FPR)) %>% 
+  ggplot(aes(x=model,y=value,fill=data))+
+    geom_bar(stat='identity', position = 'dodge')+
+    facet_wrap(~name,scales = 'free')+
+    labs(x='Model',y='Value',color = 'Dataset')+
+    theme(axis.text.x = element_text(angle = 45, vjust = 1, hjust=1))
+```
+
+# Findings, predictions on holdout and photos
+
+
+```{r}
+predict_image_pixels <- function(model, thresh, image_path) {
+  library(magick)
+  
+  # Read image and convert to RGB array
+img <- image_read(image_path)
+raster_img <- as.raster(img)
+
+# Convert raster to a data frame
+img_df <- expand.grid(
+  x = seq_len(ncol(raster_img)),
+  y = seq_len(nrow(raster_img))
+) %>%
+  mutate(
+    y = nrow(raster_img) - y + 1, #flip y
+    hex = as.vector(raster_img),
+    Red   = col2rgb(hex)[1, ],
+    Green = col2rgb(hex)[2, ],
+    Blue  = col2rgb(hex)[3, ]
+  )
+
+  
+  #Predict with custom threshold
+  predictions <- predict_at_threshold(model, img_df, thresh)
+  
+  predictions <- predictions %>% 
+    mutate(
+      .pred_class = as.factor(.pred_class),
+      fill_rgb = rgb(Red, Green, Blue, maxColorValue = 255)
+    )
+  return(predictions)
+}
+
+
+```
+
+```{r}
+generate_plots <- function(pixel_predictions){
+  # Plot A: Original photo (RGB fill only)
+  plot_original <- pixel_predictions %>%
+    ggplot() +
+    geom_tile(aes(x = x, y = y, fill = fill_rgb)) +
+    scale_fill_identity() +
+    scale_y_reverse() +
+    coord_fixed() +
+    theme_void() +
+    ggtitle("Original Image")
+  
+  # Plot B: Heatmap of Tarp Probability
+  plot_heatmap <- pixel_predictions %>%
+    ggplot() +
+    geom_tile(data = ~ filter(.x, .pred_class == "Not Tarp"),
+              aes(x = x, y = y, fill = fill_rgb)) +
+    scale_fill_identity() +
+    ggnewscale::new_scale_fill() +
+    geom_tile(data = ~ filter(.x, .pred_class == "Tarp"),
+              aes(x = x, y = y, fill = .pred_Tarp)) +
+    scale_fill_gradientn(colors = c("white", "lightblue", "blue")) +
+    scale_y_reverse() +
+    coord_fixed() +
+    theme_void()+
+    ggtitle("Tarp Probability Heatmap")
+  
+  
+  plot_original + plot_heatmap  
+}
+```
+
+```{r}
+pixel_preds_log <- predict_image_pixels( logreg_tune_wf_final%>% fit(train),  .24,"C:/Users/pfost/DS6030/Project/orthovnir078_makeshift_villiage1-1.jpg")
+log_plot <- generate_plots(pixel_preds_log)
+```
+
+```{r}
+log_plot+plot_annotation(title = "Log")
+```
+
+```{r}
+pixel_preds <- predict_image_pixels(knn_fit, get_thresh('KNN') ,"../data/village1.jpg")
+generate_plots(pixel_preds)
+```
+
+```{r}
+pixel_preds <- predict_image_pixels(knn_fit, get_thresh('KNN') ,"../data/village2.jpg")
+generate_plots(pixel_preds)
+```
+
+```{r}
+train_rec <- recipe(data = train, formula = Tarp ~ Red + Green + Blue) %>% 
+  step_normalize(all_numeric_predictors()) %>% 
+  step_pca(all_numeric_predictors())
+
+train_pca <-train_rec %>%
+  prep() %>% 
+  bake(new_data = NULL)
+  
+```
+
+```{r}
+train_pca %>% 
+  ggplot(aes(x=PC1, y=PC2, color = Tarp))+
+  geom_point(alpha = .6)+
+  scale_color_manual(values = c("Tarp" = "lightblue", "Not Tarp" = "sienna3"))+
+  labs(title = "Principal Component Analysis of RGB values")
+```
